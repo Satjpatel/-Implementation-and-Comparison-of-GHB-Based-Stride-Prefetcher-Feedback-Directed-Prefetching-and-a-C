@@ -1,0 +1,283 @@
+//
+// From Data Prefetching Championship Simulator 2
+// Seth Pugsley, seth.h.pugsley@intel.com
+//
+
+/*
+
+  This file describes an Instruction Pointer-based (Program Counter-based) stride prefetcher.  
+  The prefetcher detects stride patterns coming from the same IP, and then 
+  prefetches additional cache lines.
+
+  Prefetches are issued into the L2 or LLC depending on L2 MSHR occupancy.
+
+ */
+
+#include "cache.h"
+using namespace std;
+#define IP_TRACKER_COUNT 1024
+#define PREFETCH_DEGREE 3
+
+
+#define INDEX_TABLE_COUNT 1024
+#define GHB_COUNT 1024
+
+
+class ghb_table {
+  public:
+	//miss address storage field
+	uint64_t miss_addr;
+
+	//pointer to previous miss address entry in ghb
+	ghb_table* ghb_prev_ptr;
+
+	ghb_table () {
+		miss_addr = 0;
+		ghb_prev_ptr = NULL;
+	};
+};
+
+class index_table {
+
+  public:
+	//the IP to track the tag
+	uint64_t ip;
+	
+	//pointer to ghb
+	ghb_table* it_to_ghb_ptr;
+
+	// use LRU to evict old PC
+    	uint32_t lru;
+	
+	index_table () {
+		ip = 0;
+		it_to_ghb_ptr = NULL;
+		lru = 0;
+	};
+};
+
+index_table it_entries[INDEX_TABLE_COUNT];
+
+
+
+ghb_table ghb_entries[GHB_COUNT];
+
+ghb_table* head_ptr;
+int ghb_track = 0;
+
+int rewrite = 0;
+
+/*class IP_TRACKER {
+  public:
+    // the IP we're tracking
+    uint64_t ip;
+
+    // the last address accessed by this IP
+    uint64_t last_cl_addr;
+
+    // the stride between the last two addresses accessed by this IP
+    int64_t last_stride;
+
+    // use LRU to evict old IP trackers
+    uint32_t lru;
+
+    IP_TRACKER () {
+        ip = 0;
+        last_cl_addr = 0;
+        last_stride = 0;
+        lru = 0;
+    };
+}; */
+
+//IP_TRACKER trackers[IP_TRACKER_COUNT];
+
+void CACHE::l2c_prefetcher_initialize() 
+{
+    cout << "CPU " << cpu << " L2C GHB Constant Stride Prefetcher" << endl;
+    for (int i=0; i<INDEX_TABLE_COUNT; i++)
+        it_entries[i].lru = i;
+}
+
+uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in)
+{
+    //cout<<"Entering prefetcher\n";
+    // check for a tracker hit
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+
+    int index = -1;
+    for (index=0; index<INDEX_TABLE_COUNT; index++) {
+        if (it_entries[index].ip == ip)
+            break;
+    }
+    // index is now the place where ip is found or INDEX_TABLE_COUNT if ip not found	
+    // this is a new IP that doesn't have an entry in it_entries which is Index Table yet
+    if (index == INDEX_TABLE_COUNT) {
+	
+	//Check the index whose lru is highest or least recently used (0 most recent used, 256 is least recent used)
+        for (index=0; index<INDEX_TABLE_COUNT; index++) {
+            if (it_entries[index].lru == (INDEX_TABLE_COUNT-1))
+                break;
+        }
+	
+	//index is now where the ip needs to be added to it_entries index table
+        it_entries[index].ip = ip;
+                
+        //cout << "[IP_STRIDE] MISS index: " << index << " lru: " << trackers[index].lru << " ip: " << hex << ip << " cl_addr: " << cl_addr << dec << endl;
+	
+	//Updating LRU numbers of other entries to maintain LRU queue
+        for (int i=0; i<INDEX_TABLE_COUNT; i++) {
+            if (it_entries[i].lru < it_entries[index].lru)
+                it_entries[i].lru++;
+        }
+        it_entries[index].lru = 0;
+	//Assigning value to GHB if GHB is empty
+	if (head_ptr == NULL) //when GHB is empty
+	{
+		//cout<<"Entering code when head pointer is null\n";
+		//cout<<ghb_track<<"\n";
+		//cout<<ghb_entries[ghb_track].miss_addr<<"\n";
+		//cout<<head_ptr<<" "<<&ghb_entries[ghb_track].miss_addr<<"\n";
+		head_ptr = &ghb_entries[ghb_track]; //assign head_ptr to point to ghb_entries element tracked by ghb_track (0 in case the GHB is empty)
+	        //cout<<head_ptr<<" "<<&ghb_entries[ghb_track].miss_addr<<"\n";	
+	//	cout<<"After assignment of head pointer\n";
+	}
+	//cout<<"1 \n";
+	head_ptr->miss_addr = cl_addr;
+	//cout<<"2 \n";
+	head_ptr->ghb_prev_ptr = NULL;
+	//cout<<"3 \n";
+
+	//Assigning the index table link as the head_ptr
+	it_entries[index].it_to_ghb_ptr = head_ptr;
+	//cout<<"4 \n";
+	//To update ghb_track as a circular FIFO queue
+        if (ghb_track == (GHB_COUNT-1))
+		{ghb_track = 0; rewrite = 1;}
+	else 
+		ghb_track++;
+        //cout<<ghb_track<<" ";
+	head_ptr = &ghb_entries[ghb_track]; // Incrementing head_ptr to the next element in GHB
+	//cout<<head_ptr<<" lolol "<<&ghb_entries[ghb_track].miss_addr<<"\n";
+	return metadata_in;
+    }
+
+    // This part of the code is entered if the ip is found in the index table
+    // sanity check
+    // at this point we should know a matching tracker index
+    if (index == -1)
+        assert(0);
+
+    //Assigning value to GHB
+	head_ptr->miss_addr = cl_addr;
+	head_ptr->ghb_prev_ptr = it_entries[index].it_to_ghb_ptr;
+	//cout<<"One point:"<<head_ptr->ghb_prev_ptr<<" "<<it_entries[index].it_to_ghb_ptr<<"\n";
+
+	it_entries[index].it_to_ghb_ptr = head_ptr;
+	//cout<<"Check point:"<<head_ptr<<" "<<it_entries[index].it_to_ghb_ptr<<"\n";
+
+    if (ghb_track == (GHB_COUNT-1))
+		{ghb_track = 0;rewrite = 1;}
+	else 
+		ghb_track ++;
+	//cout<<ghb_track<<"\n";
+	head_ptr = &ghb_entries[ghb_track];
+        //cout<<head_ptr<<" "<<&ghb_entries[ghb_track].miss_addr<<"\n";
+    // calculate the stride between the current address and the last address
+    // this bit appears overly complicated because we're calculating
+    // differences between unsigned address variables
+    int64_t stride = 0;
+    int64_t last_stride = 0;
+    ghb_table* temp = it_entries[index].it_to_ghb_ptr;
+    uint64_t temp_addr;
+    //cout<<"Next point:"<<head_ptr<<" "<<temp->ghb_prev_ptr<<it_entries[index].it_to_ghb_ptr<<"\n";
+    for(int i =0; i<2 ;i++)
+    {
+	if(((head_ptr - temp->ghb_prev_ptr) > 0 && (head_ptr - temp) < 0) || temp->ghb_prev_ptr == NULL)
+	{
+		//temp->ghb_prev_ptr;
+		stride = 0;
+	}
+	else
+	{
+		//cout<<"Heyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\n";
+		temp_addr = temp->miss_addr;
+		temp = temp->ghb_prev_ptr;
+		//cout<<"Next Hey\n";
+		if (i ==0)
+		{
+			if(temp_addr > temp->miss_addr)
+				stride = temp_addr - temp->miss_addr;
+			else {
+				stride = temp->miss_addr - temp_addr;
+				stride *= -1;
+			}
+		}
+		else 
+		{
+			if(temp_addr > temp->miss_addr)
+				last_stride = temp_addr - temp->miss_addr;
+			else {
+				last_stride = temp->miss_addr - temp_addr;
+				last_stride *= -1;
+			}	
+		}	
+			
+	}
+    }
+    /*if (it_entries[index].it_to_ghb_pointer->ghb_prev_ptr > trackers[index].last_cl_addr)
+        stride = cl_addr - trackers[index].last_cl_addr;
+    else {
+        stride = trackers[index].last_cl_addr - cl_addr;
+        stride *= -1;
+    }*/
+
+    //cout << "[IP_STRIDE] HIT  index: " << index << " lru: " << trackers[index].lru << " ip: " << hex << ip << " cl_addr: " << cl_addr << dec << " stride: " << stride << endl;
+
+    // don't do anything if we somehow saw the same address twice in a row
+    if (stride == 0)
+        return metadata_in;
+
+    // only do any prefetching if there's a pattern of seeing the same
+    // stride more than once
+//cout<<"Before prefetch code\n";
+    if (stride == last_stride) {
+	//cout<<"In prefetch code\n";
+        // do some prefetching
+        for (int i=0; i<PREFETCH_DEGREE; i++) {
+            uint64_t pf_address = (cl_addr + (stride*(i+1))) << LOG2_BLOCK_SIZE;
+
+            // only issue a prefetch if the prefetch address is in the same 4 KB page 
+            // as the current demand access address
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                break;
+
+            // check the MSHR occupancy to decide if we're going to prefetch to the L2 or LLC
+            if (MSHR.occupancy < (MSHR.SIZE>>1))
+	      prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+            else
+	      prefetch_line(ip, addr, pf_address, FILL_LLC, 0);
+        }
+    }
+
+    //trackers[index].last_cl_addr = cl_addr;
+    //trackers[index].last_stride = stride;
+
+    for (int i=0; i<INDEX_TABLE_COUNT; i++) {
+        if (it_entries[i].lru < it_entries[index].lru)
+            it_entries[i].lru++;
+    }
+    it_entries[index].lru = 0;
+
+    return metadata_in;
+}
+
+uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
+{
+  return metadata_in;
+}
+
+void CACHE::l2c_prefetcher_final_stats()
+{
+    cout << "CPU " << cpu << " L2C PC-based stride prefetcher final stats" << endl;
+}
+
